@@ -2002,3 +2002,32 @@ def test_video_upload_within_limit_not_rejected_for_size(test_client, mocker: Mo
         files={"input_reference": ("ref.png", small_image, "image/png")},
     )
     assert response.status_code != 413
+
+
+def test_video_audio_reference_data_url_rejected_when_too_large(test_client, monkeypatch):
+    """A data-URL audio_reference whose decoded payload exceeds the limit is
+    rejected with HTTP 413."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    big_audio = base64.b64encode(b"z" * 1024).decode("utf-8")
+    audio_reference = json.dumps({"audio_url": f"data:audio/wav;base64,{big_audio}"})
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "loud", "audio_reference": audio_reference},
+    )
+    assert response.status_code == 413
+    assert "VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES" in response.json()["detail"]
+
+
+def test_video_audio_reference_data_url_within_limit_not_rejected_for_size(test_client, mocker: MockerFixture):
+    """A within-limit data-URL audio reference is not rejected on size grounds."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"ok-mp4",
+    )
+    small_audio = base64.b64encode(b"small-audio-bytes").decode("utf-8")
+    audio_reference = json.dumps({"audio_url": f"data:audio/wav;base64,{small_audio}"})
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "quiet", "audio_reference": audio_reference},
+    )
+    assert response.status_code != 413

@@ -96,7 +96,7 @@ from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
-from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.errors import InputReferenceTooLargeError, InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64_with_compression,
@@ -3171,7 +3171,15 @@ async def _parse_video_form(
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
         try:
-            audio_path = await decode_audio_url(request.audio_reference.audio_url)
+            audio_path = await decode_audio_url(
+                request.audio_reference.audio_url,
+                max_bytes=VIDEO_MAX_UPLOAD_BYTES,
+            )
+        except InputReferenceTooLargeError as exc:
+            _cleanup_video_references(reference_video, None)
+            raise HTTPException(
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value, detail=str(exc)
+            ) from exc
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, None)
             raise HTTPException(400, detail=str(exc)) from exc

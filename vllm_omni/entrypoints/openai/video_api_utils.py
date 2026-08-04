@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
 
-from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.errors import InputReferenceTooLargeError, InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     FileImageReference,
     FileVideoReference,
@@ -217,9 +217,22 @@ async def decode_video_url(
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
 
-async def decode_audio_url(audio_url: str) -> str:
-    """Decode an audio URL or data-URL to a temporary file path."""
+async def decode_audio_url(audio_url: str, *, max_bytes: int | None = None) -> str:
+    """Decode an audio URL or data-URL to a temporary file path.
+
+    When ``max_bytes`` is set, an audio payload larger than the limit is
+    rejected with :class:`InputReferenceTooLargeError` (surfaced as HTTP 413).
+    For http(s) URLs the body is streamed and aborted as soon as the limit is
+    exceeded, so an oversized remote file is never fully buffered.
+    """
     import tempfile
+
+    def _check_limit(size: int) -> None:
+        if max_bytes is not None and size > max_bytes:
+            raise InputReferenceTooLargeError(
+                f"audio_reference is {size} bytes, exceeding the {max_bytes}-byte limit "
+                f"(set VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES to change it)."
+            )
 
     audio_bytes: bytes | None = None
 
@@ -231,16 +244,23 @@ async def decode_audio_url(audio_url: str) -> str:
             raise InvalidInputReferenceError(
                 "Invalid audio_reference.audio_url: audio data is not valid base64."
             ) from exc
+        _check_limit(len(audio_bytes))
     elif audio_url.startswith(("http://", "https://")):
+        chunks: list[bytes] = []
+        total = 0
         async with httpx.AsyncClient(timeout=60) as client:
             try:
-                response = await client.get(audio_url)
-                response.raise_for_status()
+                async with client.stream("GET", audio_url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        total += len(chunk)
+                        _check_limit(total)
+                        chunks.append(chunk)
             except httpx.HTTPError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid audio_reference.audio_url: failed to download audio."
                 ) from exc
-        audio_bytes = response.content
+        audio_bytes = b"".join(chunks)
     else:
         raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
 

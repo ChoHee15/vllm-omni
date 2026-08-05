@@ -130,7 +130,36 @@ def _decode_media_bytes(
             ) from video_exc
 
 
-def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
+def _enforce_reference_limit(size: int, max_bytes: int | None, source: str) -> None:
+    """Raise :class:`InputReferenceTooLargeError` (HTTP 413) when a decoded
+    reference exceeds ``max_bytes``. A ``None`` limit disables the check."""
+    if max_bytes is not None and size > max_bytes:
+        raise InputReferenceTooLargeError(
+            f"{source} is {size} bytes, exceeding the {max_bytes}-byte limit "
+            f"(set VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES to change it)."
+        )
+
+
+async def _download_capped(url: str, *, max_bytes: int | None, source: str, fail_detail: str) -> bytes:
+    """Stream an http(s) URL into memory, aborting with HTTP 413 as soon as the
+    downloaded size exceeds ``max_bytes`` so an oversized remote file is never
+    fully buffered. Download failures raise :class:`InvalidInputReferenceError`."""
+    chunks: list[bytes] = []
+    total = 0
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    total += len(chunk)
+                    _enforce_reference_limit(total, max_bytes, source)
+                    chunks.append(chunk)
+        except httpx.HTTPError as exc:
+            raise InvalidInputReferenceError(fail_detail) from exc
+    return b"".join(chunks)
+
+
+def _decode_base64_image(input_reference: str, *, source: str, max_bytes: int | None = None) -> Image.Image:
     if input_reference:
         if input_reference.startswith("data:image"):
             _, b64_data = input_reference.split(",", 1)
@@ -141,24 +170,23 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
             image_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        _enforce_reference_limit(len(image_bytes), max_bytes, source)
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
 
-async def decode_image_url(image_url: str) -> Image.Image:
+async def decode_image_url(image_url: str, *, max_bytes: int | None = None) -> Image.Image:
     if image_url.startswith("data:image"):
-        return _decode_base64_image(image_url, source="image_reference.image_url")
+        return _decode_base64_image(image_url, source="image_reference.image_url", max_bytes=max_bytes)
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(image_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid image_reference.image_url: failed to download image."
-                ) from exc
-        return _decode_image_bytes(response.content, source="image_reference.image_url")
+        image_bytes = await _download_capped(
+            image_url,
+            max_bytes=max_bytes,
+            source="image_reference.image_url",
+            fail_detail="Invalid image_reference.image_url: failed to download image.",
+        )
+        return _decode_image_bytes(image_bytes, source="image_reference.image_url")
 
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
 
@@ -169,6 +197,7 @@ def _decode_base64_video(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
+    max_bytes: int | None = None,
 ) -> VideoFrames:
     if video_reference:
         if video_reference.startswith("data:video"):
@@ -180,6 +209,7 @@ def _decode_base64_video(
             video_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
+        _enforce_reference_limit(len(video_bytes), max_bytes, source)
         return _decode_video_bytes(video_bytes, source=source, max_frames=max_frames, keep=keep)
     raise InvalidInputReferenceError(f"Invalid {source}: video data is empty.")
 
@@ -189,6 +219,7 @@ async def decode_video_url(
     *,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
+    max_bytes: int | None = None,
 ) -> VideoFrames:
     if video_url.startswith("data:video"):
         return _decode_base64_video(
@@ -196,19 +227,18 @@ async def decode_video_url(
             source="video_reference.video_url",
             max_frames=max_frames,
             keep=keep,
+            max_bytes=max_bytes,
         )
 
     if video_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                response = await client.get(video_url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid video_reference.video_url: failed to download video."
-                ) from exc
+        video_bytes = await _download_capped(
+            video_url,
+            max_bytes=max_bytes,
+            source="video_reference.video_url",
+            fail_detail="Invalid video_reference.video_url: failed to download video.",
+        )
         return _decode_video_bytes(
-            response.content,
+            video_bytes,
             source="video_reference.video_url",
             max_frames=max_frames,
             keep=keep,
@@ -227,13 +257,6 @@ async def decode_audio_url(audio_url: str, *, max_bytes: int | None = None) -> s
     """
     import tempfile
 
-    def _check_limit(size: int) -> None:
-        if max_bytes is not None and size > max_bytes:
-            raise InputReferenceTooLargeError(
-                f"audio_reference is {size} bytes, exceeding the {max_bytes}-byte limit "
-                f"(set VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES to change it)."
-            )
-
     audio_bytes: bytes | None = None
 
     if audio_url.startswith("data:audio"):
@@ -244,23 +267,14 @@ async def decode_audio_url(audio_url: str, *, max_bytes: int | None = None) -> s
             raise InvalidInputReferenceError(
                 "Invalid audio_reference.audio_url: audio data is not valid base64."
             ) from exc
-        _check_limit(len(audio_bytes))
+        _enforce_reference_limit(len(audio_bytes), max_bytes, "audio_reference")
     elif audio_url.startswith(("http://", "https://")):
-        chunks: list[bytes] = []
-        total = 0
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                async with client.stream("GET", audio_url) as response:
-                    response.raise_for_status()
-                    async for chunk in response.aiter_bytes(1024 * 1024):
-                        total += len(chunk)
-                        _check_limit(total)
-                        chunks.append(chunk)
-            except httpx.HTTPError as exc:
-                raise InvalidInputReferenceError(
-                    "Invalid audio_reference.audio_url: failed to download audio."
-                ) from exc
-        audio_bytes = b"".join(chunks)
+        audio_bytes = await _download_capped(
+            audio_url,
+            max_bytes=max_bytes,
+            source="audio_reference",
+            fail_detail="Invalid audio_reference.audio_url: failed to download audio.",
+        )
     else:
         raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
 
@@ -291,6 +305,7 @@ async def decode_input_reference(
     *,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
+    max_bytes: int | None = None,
 ) -> Image.Image | VideoFrames | None:
     """Decode media input from multipart bytes, data URLs, or typed references."""
 
@@ -307,7 +322,7 @@ async def decode_input_reference(
         )
 
     if isinstance(image_reference, UrlImageReference):
-        return await decode_image_url(image_reference.image_url)
+        return await decode_image_url(image_reference.image_url, max_bytes=max_bytes)
     elif isinstance(image_reference, FileImageReference):
         raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
 
@@ -316,6 +331,7 @@ async def decode_input_reference(
             video_reference.video_url,
             max_frames=max_video_frames,
             keep=video_keep,
+            max_bytes=max_bytes,
         )
     elif isinstance(video_reference, FileVideoReference):
         raise InvalidInputReferenceError("Invalid video_reference: file_id is not supported yet.")

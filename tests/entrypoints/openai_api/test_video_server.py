@@ -2031,3 +2031,46 @@ def test_video_audio_reference_data_url_within_limit_not_rejected_for_size(test_
         data={"prompt": "quiet", "audio_reference": audio_reference},
     )
     assert response.status_code != 413
+
+
+def test_video_image_reference_data_url_rejected_when_too_large(test_client, monkeypatch):
+    """A data-URL image_reference whose decoded payload exceeds the limit is
+    rejected with HTTP 413."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    data_url = _make_test_image_data_url(size=(128, 128))
+    image_reference = json.dumps({"image_url": data_url})
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "big image", "image_reference": image_reference},
+    )
+    assert response.status_code == 413
+    assert "VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES" in response.json()["detail"]
+
+
+def test_video_video_reference_data_url_rejected_when_too_large(test_client, monkeypatch):
+    """A data-URL video_reference whose decoded payload exceeds the limit is
+    rejected with HTTP 413."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    data_url = _make_test_video_data_url()
+    video_reference = json.dumps({"video_url": data_url})
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "big video", "video_reference": video_reference},
+    )
+    assert response.status_code == 413
+    assert "VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES" in response.json()["detail"]
+
+
+def test_video_image_reference_data_url_within_limit_not_rejected_for_size(test_client, mocker: MockerFixture):
+    """A within-limit data-URL image reference is not rejected on size grounds."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"ok-mp4",
+    )
+    data_url = _make_test_image_data_url(size=(64, 64))
+    image_reference = json.dumps({"image_url": data_url})
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "small image", "image_reference": image_reference},
+    )
+    assert response.status_code != 413

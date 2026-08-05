@@ -3161,7 +3161,12 @@ async def _parse_video_form(
                 input_reference_bytes,
                 max_video_frames=decode_spec.max_frames,
                 video_keep=decode_spec.keep,
+                max_bytes=VIDEO_MAX_UPLOAD_BYTES,
             )
+        except InputReferenceTooLargeError as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value, detail=str(exc)
+            ) from exc
         except InvalidInputReferenceError as exc:
             raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
 

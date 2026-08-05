@@ -2954,11 +2954,13 @@ async def _run_video_generation_job(
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
-# Maximum accepted size for a single uploaded reference (image/video) in bytes.
-# Enforced by streaming byte counting so an oversized upload is rejected without
-# first buffering the whole payload in memory or on disk. Configurable for
-# deployments that need to serve larger Ref2VA references or tighten the limit
-# on memory-constrained hosts.
+# Maximum accepted total size for a request's uploaded references (image/video)
+# in bytes. For a single upload this bounds that file; for multi-file
+# input_references it bounds the cumulative total across all files. Enforced by
+# streaming byte counting so an oversized upload is rejected without first
+# buffering the whole payload in memory or on disk. Configurable for deployments
+# that need to serve larger Ref2VA references or tighten the limit on
+# memory-constrained hosts.
 VIDEO_MAX_UPLOAD_BYTES = int(os.environ.get("VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES", 512 * 1024 * 1024))
 
 
@@ -2990,6 +2992,7 @@ async def _read_upload_capped(upload: UploadFile) -> bytes:
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
     paths: list[str] = []
+    total_written = 0
     try:
         for upload in uploads:
             suffix = Path(upload.filename or "").suffix.lower()
@@ -2997,12 +3000,11 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
                 suffix = ".mp4"
             fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
             paths.append(path)
-            written = 0
             with os.fdopen(fd, "wb") as output:
                 while chunk := await upload.read(1024 * 1024):
-                    written += len(chunk)
-                    if written > VIDEO_MAX_UPLOAD_BYTES:
-                        _reject_oversized_upload(written, filename=upload.filename)
+                    total_written += len(chunk)
+                    if total_written > VIDEO_MAX_UPLOAD_BYTES:
+                        _reject_oversized_upload(total_written, filename=upload.filename)
                     output.write(chunk)
     except Exception:
         for path in paths:

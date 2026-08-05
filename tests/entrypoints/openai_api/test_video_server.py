@@ -2074,3 +2074,23 @@ def test_video_image_reference_data_url_within_limit_not_rejected_for_size(test_
         data={"prompt": "small image", "image_reference": image_reference},
     )
     assert response.status_code != 413
+
+
+def test_video_upload_multi_reference_total_size_enforced(test_client, monkeypatch):
+    """Multiple input_references files, each individually within the limit but
+    exceeding it in aggregate, are rejected with HTTP 413 (total-size, not
+    per-file, semantics)."""
+    monkeypatch.setattr(api_server, "VIDEO_MAX_UPLOAD_BYTES", 16)
+    part = b"a" * 10  # each 10B <= 16B limit, but 2x10=20B > 16B total
+    tmp_before = set(Path(tempfile.gettempdir()).glob("vllm_omni_video_reference_*"))
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "two small files over total"},
+        files=[
+            ("input_references", ("a.mp4", part, "video/mp4")),
+            ("input_references", ("b.mp4", part, "video/mp4")),
+        ],
+    )
+    assert response.status_code == 413
+    tmp_after = set(Path(tempfile.gettempdir()).glob("vllm_omni_video_reference_*"))
+    assert tmp_after == tmp_before, "rejected multi-upload must not leave temp files"

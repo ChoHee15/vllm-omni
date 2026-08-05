@@ -2954,13 +2954,18 @@ async def _run_video_generation_job(
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
-# Maximum accepted total size for a request's uploaded references (image/video)
-# in bytes. For a single upload this bounds that file; for multi-file
-# input_references it bounds the cumulative total across all files. Enforced by
-# streaming byte counting so an oversized upload is rejected without first
-# buffering the whole payload in memory or on disk. Configurable for deployments
-# that need to serve larger Ref2VA references or tighten the limit on
-# memory-constrained hosts.
+# Maximum accepted size (bytes) for uploaded references, applied per channel:
+# each of single input_reference, multi-file input_references (cumulative across
+# its files), image_reference, video_reference, and audio_reference is bounded
+# independently — a request mixing several channels can therefore aggregate up
+# to N x this limit, but in practice these channels are mutually exclusive.
+# Raw multipart uploads and http(s) URL references are enforced by streaming
+# byte counting, so an oversized payload is rejected without fully buffering it.
+# data-URL (base64) references are a best-effort check applied after decode (the
+# base64 string already resides in the parsed form body), so bounding very large
+# data-URLs pre-decode would require an ASGI/body-size limit outside this scope.
+# Configurable for deployments needing larger Ref2VA references or a tighter cap
+# on memory-constrained hosts.
 VIDEO_MAX_UPLOAD_BYTES = int(os.environ.get("VLLM_OMNI_VIDEO_MAX_UPLOAD_BYTES", 512 * 1024 * 1024))
 
 
@@ -3156,6 +3161,10 @@ async def _parse_video_form(
         paths = await _persist_uploaded_video_references(input_references)
         reference_video = ReferenceVideo(data=paths, cleanup_paths=tuple(paths))
     else:
+        # This branch is mutually exclusive with the input_references path
+        # above: image/video references are decoded in memory (data-URL) or via
+        # _download_capped (streamed to memory), so no temp files exist here and
+        # the 413/400 handlers below have nothing to clean up.
         try:
             media_data = await decode_input_reference(
                 request.image_reference,

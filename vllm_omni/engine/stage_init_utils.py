@@ -1008,7 +1008,8 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
             "Or omit the top-level --tensor-parallel-size and set it only in "
             "stage-0's override."
         ) from e
-        
+
+
 def build_legacy_engine_args_dict(
     stage_config: Any,
     model: str,

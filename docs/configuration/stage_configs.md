@@ -44,7 +44,7 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `max_num_batched_tokens` | int | optional | `32768` | Prefill budget. |
 | `max_model_len` | int \| null | optional | `null` | Per-stage context length (auto-sets `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` when larger than HF default). |
 | `async_scheduling` | bool \| null | optional | `null` | Per-stage async scheduling toggle. |
-| `devices` | str | optional | `"0"` | `CUDA_VISIBLE_DEVICES`-style device list. |
+| `devices` | str | optional | `"0"` | `CUDA_VISIBLE_DEVICES`-style device list. The number of device ids must equal this stage's world size (`tensor_parallel_size` × `data_parallel_size` × `pipeline_parallel_size`, or `num_replicas` × that product for a replica pool); a mismatch fails early — see the note under [`runtime.devices`](#runtimedevices). |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
@@ -364,6 +364,8 @@ Default: `true`
 Logical device indices for this stage, specified as a string. Values are **logical indices** (`0`, `1`, `2`, ...) — not physical GPU IDs — and are mapped through the platform's visibility env var (`CUDA_VISIBLE_DEVICES` on CUDA, `ASCEND_RT_VISIBLE_DEVICES` on NPU) before being applied via `torch.cuda.set_device()` (or the equivalent).
 
 Example: if `CUDA_VISIBLE_DEVICES=0,2,4` is set in the environment, then `devices: "0"` selects physical GPU 0 (the first visible), `devices: "1"` selects physical GPU 2, and `devices: "0,1"` makes physical GPUs 0 and 2 available to the stage. If no visibility env var is set, logical and physical IDs coincide.
+
+**Note:** the device count must equal this stage's world size (`tensor_parallel_size` × `data_parallel_size` × `pipeline_parallel_size`, or `num_replicas` × `tensor_parallel_size` × `data_parallel_size` × `pipeline_parallel_size` for a replica pool). A top-level `--tensor-parallel-size` is broadcast to every stage, so a single-GPU stage can violate this; it now fails early naming the offending stage ([issue #5003](gh-issue:5003)) — fix with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set tp only on the multi-GPU stage.
 
 Default: `"0"`
 

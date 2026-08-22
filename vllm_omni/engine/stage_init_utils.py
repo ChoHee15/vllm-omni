@@ -645,8 +645,25 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
     return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
 
 
+def get_stage_pp_size(stage_cfg: Any) -> int:
+    """Extract pipeline_parallel_size from a stage config object."""
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    if hasattr(engine_args, "get"):
+        return int(engine_args.get("pipeline_parallel_size", 1) or 1)
+    return int(getattr(engine_args, "pipeline_parallel_size", 1) or 1)
+
+
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
-    """Return the number of devices consumed by one replica of *stage_cfg*."""
+    """Return the number of devices consumed by one replica of *stage_cfg*.
+
+    For LLM stages this is ``tensor_parallel_size * pipeline_parallel_size`` —
+    both are intra-engine dimensions that consume GPUs visible to the same stage
+    process (this is the per-replica width :func:`split_devices_for_replicas`
+    carves a stage's ``devices`` pool into). ``data_parallel_size`` is *not*
+    included: data parallelism spawns additional engine processes rather than
+    widening a single replica's device list. For diffusion stages the diffusion
+    parallel ``world_size`` already accounts for its parallel dimensions.
+    """
     engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
@@ -664,7 +681,7 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
         except Exception:
             return 1
 
-    return get_stage_tp_size(stage_cfg)
+    return max(1, get_stage_tp_size(stage_cfg) * get_stage_pp_size(stage_cfg))
 
 
 def compute_replica_layout(
@@ -1038,37 +1055,75 @@ def _finalize_engine_args_dict(
     return engine_args_dict
 
 
+def _count_device_ids(devices: Any) -> int | None:
+    """Count device ids in a ``devices`` value, or None when unspecified."""
+    if devices is None:
+        return None
+    if isinstance(devices, (list, tuple)):
+        return len(list(devices))
+    text = str(devices).strip()
+    if not text:
+        return None
+    return len([d for d in text.split(",") if d.strip()])
+
+
 def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
-    """Fail early when a stage's world size cannot fit its assigned ``devices``.
+    """Fail early when a stage's assigned ``devices`` cannot fit one local replica.
 
-    Re-runs :func:`check_device_layout` (normally only reached on the
-    ``--strategy-config`` path) against the fully resolved per-stage layout, so
-    an inconsistent ``tensor_parallel_size`` vs ``devices`` (issue #5003) is
-    reported here with a clear message instead of surfacing later as an opaque
-    worker-side ``local rank ... out of bounds`` assertion.
+    A stage's ``devices`` lists the GPUs visible to a single stage *process*, so
+    the count must match the per-replica device width that the runtime device
+    splitter (:func:`split_devices_for_replicas`) actually uses — i.e.
+    :func:`get_stage_devices_per_replica` (tensor × pipeline parallel width for
+    LLM stages, the diffusion world size for diffusion stages). Two shapes are
+    accepted: a single per-replica template (``count == per_replica``) or the
+    full pool across replicas (``count == num_replicas * per_replica``).
+
+    This mirrors the splitter exactly, so a layout that passes here cannot later
+    fail the splitter or surface as an opaque worker-side ``local rank ... out of
+    bounds`` assertion (issue #5003). ``data_parallel_size`` is deliberately
+    *not* multiplied in: ``devices`` is per-process, and data parallelism is
+    expressed across processes (with a possibly smaller
+    ``data_parallel_size_local`` per node), not within one stage's device list.
     """
-    from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
-
     runtime = getattr(stage_config, "runtime", None)
     devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
     if devices is None:
         # No explicit placement -> vLLM assigns devices itself; nothing to check.
         return
 
-    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    count = _count_device_ids(devices)
+    if count is None:
+        return
+
+    num_replicas = int(_get_attr_or_item(runtime, "num_replicas", 1) or 1) if runtime is not None else 1
+    per_replica = max(1, int(get_stage_devices_per_replica(stage_config)))
     stage_id = getattr(stage_config, "stage_id", "?")
-    try:
-        check_device_layout(
-            devices,
-            tensor_parallel_size=int(engine_args_dict.get("tensor_parallel_size", 1) or 1),
-            data_parallel_size=int(engine_args_dict.get("data_parallel_size", 1) or 1),
-            pipeline_parallel_size=int(engine_args_dict.get("pipeline_parallel_size", 1) or 1),
-            num_replicas=int(num_replicas or 1),
-            role=f"stage-{stage_id}",
+
+    valid = {per_replica, num_replicas * per_replica}
+    if count in valid:
+        return
+
+    stage_type = _get_attr_or_item(stage_config, "stage_type", "llm")
+    resolved_tp = int(engine_args_dict.get("tensor_parallel_size", 1) or 1)
+
+    base = (
+        f"Stage {stage_id}: device layout is inconsistent — declared {count} device id(s) "
+        f"but each replica needs {per_replica} "
+    )
+    if num_replicas > 1:
+        base += (
+            f"(so provide {per_replica} for a per-replica template or "
+            f"{num_replicas * per_replica} for the full num_replicas={num_replicas} pool). "
         )
-    except StrategyApplyError as e:
-        raise ValueError(
-            f"Stage {stage_id}: device layout is inconsistent — {e} "
+    else:
+        base += "device(s). "
+
+    # Only surface the #5003 top-level-TP explanation when a broadcast TP is the
+    # plausible cause (an LLM stage whose resolved tensor_parallel_size is what
+    # each replica needs). Other mismatches get a generic hint so we don't
+    # misattribute a DP/PP/misconfiguration to --tensor-parallel-size.
+    if stage_type != "diffusion" and resolved_tp > 1 and resolved_tp == per_replica:
+        base += (
             "A top-level --tensor-parallel-size is applied to every stage, but each "
             "stage's `devices` is not adjusted automatically. Pass --stage-overrides "
             "to set tensor_parallel_size and devices together on every stage, so "
@@ -1078,7 +1133,13 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
             '"2": {"tensor_parallel_size": 1, "devices": "1"}}\'. '
             "Or omit the top-level --tensor-parallel-size and set it only in "
             "stage-0's override."
-        ) from e
+        )
+    else:
+        base += (
+            "Set this stage's `devices` (via --stage-overrides) to match its per-replica "
+            "device width, or adjust the stage's parallel sizes accordingly."
+        )
+    raise ValueError(base)
 
 
 def build_legacy_engine_args_dict(
